@@ -2,9 +2,7 @@ import asyncio
 import collections
 import json
 import math
-import sqlite3
 import time
-import typing as t
 import uuid
 
 import aiohttp
@@ -12,91 +10,96 @@ import bentoml
 import jinja2
 import starlette.applications
 import starlette.responses
+from pyformance.registry import MetricsRegistry
 
 import curlparser
 
 MAX_COLD_START_TIME = 20
 COLLECTION_INTERVAL = 5
 
-"""
-Time: 11
-Active Users: 1
-Request/s: 0.0
-Total Requests: 1
-Active Requests: 1
-Response Tokens/s: 0.0
-Status: defaultdict(<class 'int'>, {})
-"""
+
+def make_metrics_registry() -> MetricsRegistry:
+    registry = MetricsRegistry()
+    registry.counter("user")
+    registry.counter("request.total")
+    registry.counter("request.error")
+    registry.counter("request.timeout")
+    registry.counter("request.2xx")
+    registry.counter("request.4xx")
+    registry.counter("request.5xx")
+    registry.gauge("request.active")
+    registry.histogram("response.latency")
+    registry.histogram("response.throughput")
+    return registry
 
 
-# 创建一个内存中的 SQLite 数据库
-conn = sqlite3.connect(":memory:")
-cursor = conn.cursor()
+METRICS = collections.defaultdict(make_metrics_registry)
+DATAS = collections.defaultdict(list)
+NOTIFICATIONS = collections.defaultdict(asyncio.Event)
 
 
-METRICS = {
-    "user_active": {
-        "type": "Gauge",
-        "labels": ["time"],
-    },
-    "response": {
-        "type": "Counter",
-        "labels": ["time", "status"],
-    },
-    "exception": {
-        "type": "Counter",
-        "labels": ["time", "exception"],
-    },
-    "request_active": {
-        "type": "Gauge",
-        "labels": ["time"],
-    },
-    "client_cpu": {
-        "type": "Gauge",
-        "labels": ["time"],
-    },
-}
+async def collector_loop(request_id: str):
+    try:
+        while True:
+            registry = METRICS[request_id]
+            DATAS[request_id].append(
+                {
+                    "plot": "throughput",
+                    "data": {
+                        "x": [[time.time()]],
+                        "y": [[registry.histogram("response.throughput").get_count()]],
+                    },
+                    "trace": 0,
+                }
+            )
+            DATAS[request_id].append(
+                {
+                    "plot": "user",
+                    "data": [
+                        [registry.counter("request.total").get_count()],
+                        [registry.counter("user").get_count()],
+                        [registry.counter("request.error").get_count()],
+                        [registry.histogram("response.latency").get_mean()],
+                    ],
+                    "trace": 0,
+                    "operation": "replace",
+                }
+            )
+            NOTIFICATIONS[request_id].set()
+            await asyncio.sleep(COLLECTION_INTERVAL)
 
-cursor.execute("CREATE TABLE example (id INTEGER, name TEXT)")
-
-
-class AverageCounter:
-    def __init__(self):
-        self.value: float = 0
-        self.total = 0
-
-    def __iadd__(self, other: float):
-        self.value = other / (self.total + 1) + self.value * (
-            self.total / (self.total + 1)
-        )
-        self.total += 1
+    finally:
+        DATAS[request_id].append(None)
+        NOTIFICATIONS[request_id].set()
+        return
 
 
-def task_factory():
-    return {
-        "Active Users": collections.defaultdict(int),
-        "Active Requests": collections.defaultdict(int),
-        "Latency": collections.defaultdict(AverageCounter),
-        "2xx": collections.defaultdict(int),
-        "3xx": collections.defaultdict(int),
-        "4xx": collections.defaultdict(int),
-        "5xx": collections.defaultdict(int),
-        "Timeouts": collections.defaultdict(int),
-        "Unkown Errors": collections.defaultdict(int),
-    }
-
-
-QUEUE = collections.defaultdict(task_factory)
+async def tail_data(request_id: str):
+    cursor = 0
+    while True:
+        if cursor < len(DATAS[request_id]):
+            data = DATAS[request_id][cursor]
+            if data is None:
+                yield b"event: close\ndata: \n\n"
+                # DATAS.pop(request_id)
+                # NOTIFICATIONS.pop(request_id)
+                return
+            else:
+                yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
+                cursor += 1
+        else:
+            NOTIFICATIONS[request_id].clear()
+            await NOTIFICATIONS[request_id].wait()
 
 
 async def user_loop(request_id: str, request_info: curlparser.parser.ParsedCommand):
-    """ """
     dummy_cookie_jar = aiohttp.DummyCookieJar()
+    METRICS[request_id].counter("user").inc()
     while True:
         async with aiohttp.ClientSession(cookie_jar=dummy_cookie_jar) as session:
             now = time.time()
-            time_id = math.floor(now / COLLECTION_INTERVAL) * COLLECTION_INTERVAL
             try:
+                METRICS[request_id].counter("request.active").inc()
                 async with session.request(
                     method=request_info.method,
                     url=request_info.url,
@@ -106,27 +109,55 @@ async def user_loop(request_id: str, request_info: curlparser.parser.ParsedComma
                     timeout=request_info.max_time,
                 ) as response:
                     await response.read()
-            except aiohttp.ClientError:
-                pass
-                QUEUE[request_id]["Timeouts"][time_id] += 1
+                METRICS[request_id].histogram("response.latency").add(time.time() - now)
+                METRICS[request_id].histogram("response.throughput").add(1)
 
-            QUEUE[request_id]["Finished Requests"][time_id] += 1
-            latency = time.time() - now
-            QUEUE[request_id]["Latency"][time_id] += latency
-            if response.status // 100 == 2:
-                QUEUE[request_id]["2xx"][time_id] += 1
-            elif response.status // 100 == 3:
-                QUEUE[request_id]["3xx"][time_id] += 1
-            elif response.status // 100 == 4:
-                QUEUE[request_id]["4xx"][time_id] += 1
+                METRICS[request_id].counter("request.total").inc()
+                if response.status >= 200 and response.status < 300:
+                    METRICS[request_id].counter(f"request.{response.status}").inc()
+                elif response.status >= 400 and response.status < 500:
+                    METRICS[request_id].counter(f"request.{response.status}").inc()
+                elif response.status >= 500 and response.status < 600:
+                    METRICS[request_id].counter(f"request.{response.status}").inc()
+            # timeout
+            except asyncio.TimeoutError:
+                METRICS[request_id].counter("request.timeout").inc()
+            except asyncio.CancelledError:
+                METRICS[request_id].counter("user").dec()
+                return
+            # other errors
+            except:
+                METRICS[request_id].counter("request.error").inc()
+            finally:
+                METRICS[request_id].counter("request.active").dec()
 
 
 async def benchmark_task(result_id: str, code, users: int | None, duration: int):
-    if result_id in QUEUE:
+    if result_id in METRICS:
         return
+    if users is None:
+        users = 10
     parsed = curlparser.parse(code)
-    parsed.method
     cold_start_time = min(duration / 10, MAX_COLD_START_TIME)
+
+    benchmark_start = time.time()
+
+    user_tasks = []
+    spawn_interval = float(cold_start_time) / users
+    collector_task = asyncio.create_task(collector_loop(result_id))
+    for i in range(users):
+        user_tasks.append(
+            asyncio.create_task(user_loop(result_id, parsed), name=f"user_{i}")
+        )
+        await asyncio.sleep(spawn_interval)
+
+    await asyncio.sleep(duration - (time.time() - benchmark_start))
+    for task in user_tasks:
+        task.cancel()
+    collector_task.cancel()
+
+    await asyncio.sleep(1800)
+    METRICS.pop(result_id)
 
 
 @bentoml.service
@@ -150,9 +181,10 @@ class BentoSwissArmyKnife:
         duration: int = 300,
     ) -> dict:
         result_id = str(uuid.uuid4())
+        asyncio.create_task(benchmark_task(result_id, code, users, duration))
         return {
-            "result_id": "123",
-            "result_url": "/chart/123",
+            "result_id": result_id,
+            "result_url": f"/chart/{result_id}",
         }
 
 
@@ -219,8 +251,8 @@ async def chart(request):
     chart_id = request.path_params["chart_id"]
 
     trace = {
-        "x": [1],
-        "y": [2],
+        "x": [],
+        "y": [],
         "mode": "lines+markers",
         "type": "scatter",
     }
@@ -250,12 +282,12 @@ async def chart(request):
     }
 
     plot = {
-        "name": "plot",
+        "name": "throughput",
         "traces": [trace],
         "layout": layout,
     }
     plot2 = {
-        "name": "plot2",
+        "name": "user",
         "traces": [table],
     }
     return starlette.responses.HTMLResponse(
@@ -266,29 +298,11 @@ async def chart(request):
     )
 
 
-async def generate_data():
-    for i in range(10):
-        await asyncio.sleep(2)
-        data = {
-            "plot": "plot",
-            "data": {"x": [[i]], "y": [[i * 2]]},
-            "trace": 0,
-        }
-        yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
-        data = {
-            "plot": "plot2",
-            "data": [[i], [i * 2], [i * 3], [i * 4]],
-            "trace": 0,
-        }
-        yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
-    yield b"event: close\ndata: \n\n"
-
-
 @app.route("/chart/{chart_id}/stream")
 async def chart_stream(request):
     chart_id = request.path_params["chart_id"]
     return starlette.responses.StreamingResponse(
-        content=generate_data(),
+        content=tail_data(chart_id),
         media_type="text/event-stream",
     )
 
