@@ -163,7 +163,7 @@ async def _benchmark_task(result_id: str, code, users: int | None, duration: int
 
 
 @bentoml.service
-class BentoSwissArmyKnife:
+class Bees:
     @bentoml.api
     async def hpa_calculator(
         self,
@@ -181,7 +181,7 @@ class BentoSwissArmyKnife:
         code: str = "curl https://baidu.com",
         users: int = 10,
         duration: int = 300,
-        ctx: bentoml.Context = None,
+        ctx: bentoml.Context = None,  # type: ignore
     ) -> str:
         result_id = str(uuid.uuid4())
         asyncio.create_task(_benchmark_task(result_id, code, users, duration))
@@ -324,4 +324,4 @@ async def chart_stream(request):
     )
 
 
-BentoSwissArmyKnife.mount_asgi_app(app)
+Bees.mount_asgi_app(app)
