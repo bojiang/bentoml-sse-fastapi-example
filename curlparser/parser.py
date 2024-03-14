@@ -34,6 +34,7 @@ parser.add_argument("-k", "--insecure", action="store_false")
 parser.add_argument("-u", "--user", default=())
 parser.add_argument("-X", "--request", default="")
 parser.add_argument("-m", "--max-time", default=None)
+parser.add_argument("-s", "--silent", action="store_true")
 
 
 def is_url(url: str) -> bool:
