@@ -33,7 +33,18 @@ def _make_metrics_registry() -> MetricsRegistry:
 
 METRICS = collections.defaultdict(_make_metrics_registry)
 DATAS = collections.defaultdict(list)
-NOTIFICATIONS = collections.defaultdict(asyncio.Event)
+NOTI_HAS_DATA = collections.defaultdict(asyncio.Event)
+NOTI_RUNNING = collections.defaultdict(asyncio.Event)
+NOTI_STOPPING = collections.defaultdict(asyncio.Event)
+
+
+def _get_status(request_id: str):
+    if NOTI_STOPPING[request_id].is_set():
+        return "stopped"
+    if NOTI_RUNNING[request_id].is_set():
+        return "running"
+    else:
+        return "paused"
 
 
 async def _data_collector_loop(request_id: str, interval: int = 2):
@@ -42,6 +53,10 @@ async def _data_collector_loop(request_id: str, interval: int = 2):
         last_total_errors = 0
         start_time = time.time()
         while True:
+            if not NOTI_RUNNING[request_id].is_set():  # paused
+                METRICS[request_id] = _make_metrics_registry()
+                last_total = 0
+                last_total_errors = 0
             registry = METRICS[request_id]
             now = int((time.time() - start_time) * 100) / 100
 
@@ -125,6 +140,7 @@ async def _data_collector_loop(request_id: str, interval: int = 2):
                 {
                     "plot": "system",
                     "data": [
+                        [_get_status(request_id)],
                         [registry.counter("user").get_count()],
                         [registry.counter("request.total").get_count()],
                         [registry.counter("request.error").get_count()],
@@ -157,7 +173,11 @@ async def _data_collector_loop(request_id: str, interval: int = 2):
                     "operation": "replace",
                 }
             )
-            NOTIFICATIONS[request_id].set()
+            NOTI_HAS_DATA[request_id].set()
+            if NOTI_STOPPING[request_id].is_set():  # stopped
+                return
+            if not NOTI_RUNNING[request_id].is_set():  # paused
+                await NOTI_RUNNING[request_id].wait()  # wait for resume
             await asyncio.sleep(interval)
     except Exception as e:
         DATAS[request_id].append(
@@ -174,7 +194,7 @@ async def _data_collector_loop(request_id: str, interval: int = 2):
         )
     finally:
         DATAS[request_id].append(None)
-        NOTIFICATIONS[request_id].set()
+        NOTI_HAS_DATA[request_id].set()
         return
 
 
@@ -190,19 +210,29 @@ async def _stream_chart_data(request_id: str):
                 yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
                 cursor += 1
         else:
-            NOTIFICATIONS[request_id].clear()
-            await NOTIFICATIONS[request_id].wait()
+            NOTI_HAS_DATA[request_id].clear()
+            await NOTI_HAS_DATA[request_id].wait()
 
 
 async def _user_loop(
     request_id: str,
     request_info: curlparser.parser.ParsedCommand,
     timeout_override: int | None,
+    start_delay: float = 0,
 ) -> None:
+    await asyncio.sleep(start_delay)
     dummy_cookie_jar = aiohttp.DummyCookieJar()
     METRICS[request_id].counter("user").inc()
     timeout = timeout_override or request_info.max_time
     while True:
+        if NOTI_STOPPING[request_id].is_set():  # stopped
+            METRICS[request_id].counter("user").dec()
+            return
+        if not NOTI_RUNNING[request_id].is_set():  # paused
+            METRICS[request_id].counter("user").dec()
+            await NOTI_RUNNING[request_id].wait()
+            await asyncio.sleep(start_delay)
+            METRICS[request_id].counter("user").inc()
         try:
             METRICS[request_id].counter("request.active").inc()
             async with aiohttp.ClientSession(
@@ -227,9 +257,6 @@ async def _user_loop(
                     METRICS[request_id].counter(
                         f"error.{response.status}.{abstract}"
                     ).inc()
-        except asyncio.CancelledError:
-            METRICS[request_id].counter("user").dec()
-            return
         except Exception as e:
             abstract = str(e)[:50]
             METRICS[request_id].counter(f"error.{type(e).__name__}.{abstract}").inc()
@@ -238,7 +265,7 @@ async def _user_loop(
             METRICS[request_id].counter("request.active").dec()
 
 
-async def _benchmark_task(
+async def _benchmark_controller(
     result_id: str,
     code,
     users: int | None,
@@ -253,40 +280,61 @@ async def _benchmark_task(
     parsed = curlparser.parse(code)
     cold_start_time = min(duration / 3, MAX_COLD_START_TIME)
 
-    benchmark_start = time.time()
-    spawn_interval = float(cold_start_time) / users
-
-    user_tasks = []
+    tasks: list[asyncio.Task] = []
     try:
-        collector_task = asyncio.create_task(_data_collector_loop(result_id))
-        for i in range(users):
-            user_tasks.append(
-                asyncio.create_task(
-                    _user_loop(result_id, parsed, timeout_override), name=f"user_{i}"
-                )
+        tasks.append(
+            asyncio.create_task(
+                _data_collector_loop(
+                    result_id,
+                    collector_interval,
+                ),
+                name=f"collector-{result_id}",
             )
-            await asyncio.sleep(spawn_interval)
-        countdown = duration - (time.time() - benchmark_start)
-        while countdown >= 0:
-            if result_id not in METRICS:  # stop benchmark
+        )
+        for i in range(users):
+            tasks.append(
+                asyncio.create_task(
+                    _user_loop(
+                        result_id,
+                        parsed,
+                        timeout_override,
+                        start_delay=cold_start_time / users * i,
+                    ),
+                    name=f"user-{result_id}-{i}",
+                ),
+            )
+        NOTI_RUNNING[result_id].set()
+        while duration >= 0:
+            if NOTI_STOPPING[result_id].is_set():
                 break
-            await asyncio.sleep(1)
-            countdown -= 1
+            if not NOTI_RUNNING[result_id].is_set():
+                await NOTI_RUNNING[result_id].wait()
+            else:
+                await asyncio.sleep(1)
+                duration -= 1
+        else:
+            NOTI_STOPPING[result_id].set()
     finally:
-        for task in user_tasks:
-            task.cancel()
-        collector_task.cancel()
-        if result_id in METRICS:
-            METRICS.pop(result_id)
+        for task in tasks[::-1]:
+            await asyncio.wait_for(
+                task, timeout=(timeout_override or parsed.max_time or 10) + 1
+            )
 
         await asyncio.sleep(1800)
 
+        # clean
+        if result_id in METRICS:
+            METRICS.pop(result_id)
         if result_id in METRICS:
             METRICS.pop(result_id)
         if result_id in DATAS:
             DATAS.pop(result_id)
-        if result_id in NOTIFICATIONS:
-            NOTIFICATIONS.pop(result_id)
+        if result_id in NOTI_HAS_DATA:
+            NOTI_HAS_DATA.pop(result_id)
+        if result_id in NOTI_RUNNING:
+            NOTI_RUNNING.pop(result_id)
+        if result_id in NOTI_STOPPING:
+            NOTI_STOPPING.pop(result_id)
 
 
 @bentoml.service
@@ -313,7 +361,7 @@ class Bees:
     ) -> dict:
         result_id = str(uuid.uuid4())
         asyncio.create_task(
-            _benchmark_task(
+            _benchmark_controller(
                 result_id,
                 code,
                 users,
@@ -323,15 +371,28 @@ class Bees:
             )
         )
         return {
-            "status": "accepted",
+            "status": "running",
             "result": f"/chart/{result_id}",
         }
 
     @bentoml.api
     async def stop_bento_benchmark(self, result_id: str) -> dict:
-        if result_id in METRICS:
-            METRICS.pop(result_id)
-        return {"status": "accepted"}
+        NOTI_STOPPING[result_id].set()
+        return {"status": "stopped"}
+
+    @bentoml.api
+    async def pause_bento_benchmark(self, result_id: str, ctx) -> dict:
+        if NOTI_STOPPING[result_id].is_set():
+            return {"status": "stopped"}
+        NOTI_RUNNING[result_id].clear()
+        return {"status": "paused"}
+
+    @bentoml.api
+    async def resume_bento_benchmark(self, result_id: str) -> dict:
+        if NOTI_STOPPING[result_id].is_set():
+            return {"status": "stopped"}
+        NOTI_RUNNING[result_id].set()
+        return {"status": "running"}
 
 
 app = starlette.applications.Starlette()
@@ -344,6 +405,9 @@ TEMPLATE = """
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
 <body>
+<button onclick="fetch('/pause_bento_benchmark', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({result_id: '{{ chart_id }}'})})">Pause</button>
+<button onclick="fetch('/resume_bento_benchmark', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({result_id: '{{ chart_id }}'})})">Resume</button>
+<button onclick="fetch('/stop_bento_benchmark', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({result_id: '{{ chart_id }}'})})">Stop</button>
 
 {% for plot in plots %}
     <div id="{{ plot.name }}"></div>
@@ -469,6 +533,7 @@ async def chart(request):
                     "type": "table",
                     "header": {
                         "values": [
+                            "Status",
                             "Active Users",
                             "Requests",
                             "Errors",
