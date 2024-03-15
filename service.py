@@ -216,7 +216,7 @@ class Bees:
     ) -> dict:
         result_id = str(uuid.uuid4())
         asyncio.create_task(_benchmark_task(result_id, code, users, duration))
-        ctx.response.status_code = 202
+        # ctx.response.status_code = 202
         return {
             "status": "accepted",
             "result": f"/chart/{result_id}",
@@ -282,18 +282,19 @@ TEMPLATE = """
 
 
 @app.route("/")
-async def index(request):
+async def index():
     """
     Home page
 
     A form to submit a benchmark request, then jump to the result chart page.
     """
     return starlette.responses.HTMLResponse(
-        """
+        r"""
         <html>
         <head>
             <script>
-                function submitForm() {
+                function submitForm(event) {
+                    event.preventDefault();
                     var form = document.getElementById("benchmark-form");
                     var users = form.elements["users"].value;
                     var duration = form.elements["duration"].value;
@@ -313,31 +314,25 @@ async def index(request):
                             users: users,
                             duration: duration,
                         }),
-                    }).then(response => response.json())
-                    .then(data => {
+                    }).then(response => response.json()).then(data => {
                         window.location.href = data.result;
                     });
-
                 }
             </script>
-
         </head>
         <body>
-        
         <h1>Bees</h1>
         <p>A benchmark service powered by BentoML.</p>
         <p>Submit a curl command (could be copied from playground) and the number of users and duration, then jump to the result chart page.</p>
-        <form id="benchmark-form">
+        <form id="benchmark-form" onsubmit="submitForm(event)">
             <label for="code">Curl Command:</label><br>
             <textarea id="code" name="code" rows="4" cols="50">curl https://baidu.com</textarea><br>
             <label for="users">Users:</label><br>
             <input type="number" id="users" name="users" value="10"><br>
             <label for="duration">Duration:</label><br>
             <input type="number" id="duration" name="duration" value="300"><br><br>
-            <input type="submit" value="Submit" onclick="submitForm()">
+            <input type="submit" value="Submit">
         </form>
-
-
         </body>
         </html>
         """
