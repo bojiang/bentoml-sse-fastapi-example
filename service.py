@@ -213,26 +213,14 @@ class Bees:
         users: int = 10,
         duration: int = 300,
         ctx: bentoml.Context = None,  # type: ignore
-    ) -> str:
+    ) -> dict:
         result_id = str(uuid.uuid4())
         asyncio.create_task(_benchmark_task(result_id, code, users, duration))
         ctx.response.status_code = 202
-        ctx.response.headers["Content-Type"] = "text/html"
-        return """
-        <html>
-        <head>
-            <title>Accepted</title>
-        </head>
-        <body>
-            <h1>Accepted</h1>
-            <p>Your request has been accepted and is being processed.</p>
-            <p>Result ID: {result_id}</p>
-            <p>Result URL: <a href="/chart/{result_id}"> Check Result</a></p>
-        </body>
-        </html>
-        """.format(
-            result_id=result_id
-        )
+        return {
+            "status": "accepted",
+            "result": f"/chart/{result_id}",
+        }
 
 
 app = starlette.applications.Starlette()
@@ -292,6 +280,70 @@ TEMPLATE = """
 </html>
         """
 
+
+@app.route("/")
+async def index(request):
+    """
+    Home page
+
+    A form to submit a benchmark request, then jump to the result chart page.
+    """
+    return starlette.responses.HTMLResponse(
+        """
+        <html>
+        <head>
+            <script>
+                function submitForm() {
+                    var form = document.getElementById("benchmark-form");
+                    var users = form.elements["users"].value;
+                    var duration = form.elements["duration"].value;
+                    var code = form.elements["code"].value;
+                    if (users < 1 || duration < 1) {
+                        alert("Users and duration must be greater than 0");
+                        return;
+                    }
+                    // fetch the result chart page and jump to it
+                    fetch("/benchmark_bento_api", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                        },
+                        body: JSON.stringify({
+                            code: code,
+                            users: users,
+                            duration: duration,
+                        }),
+                    }).then(response => response.json())
+                    .then(data => {
+                        window.location.href = data.result;
+                    });
+
+                }
+            </script>
+
+        </head>
+        <body>
+        
+        <h1>Bees</h1>
+        <p>A benchmark service powered by BentoML.</p>
+        <p>Submit a curl command (could be copied from playground) and the number of users and duration, then jump to the result chart page.</p>
+        <form id="benchmark-form">
+            <label for="code">Curl Command:</label><br>
+            <textarea id="code" name="code" rows="4" cols="50">curl https://baidu.com</textarea><br>
+            <label for="users">Users:</label><br>
+            <input type="number" id="users" name="users" value="10"><br>
+            <label for="duration">Duration:</label><br>
+            <input type="number" id="duration" name="duration" value="300"><br><br>
+            <input type="submit" value="Submit" onclick="submitForm()">
+        </form>
+
+
+        </body>
+        </html>
+        """
+    )
+
+
 @app.route("/chart/{chart_id}")
 async def chart(request):
     chart_id = request.path_params["chart_id"]
@@ -327,6 +379,7 @@ async def chart(request):
                     "mode": "lines+markers",
                     "type": "scatter",
                     "fill": "tozeroy",
+                    "name": "success",
                 },
                 {
                     "x": [],
@@ -335,6 +388,7 @@ async def chart(request):
                     "type": "scatter",
                     "fill": "tozeroy",
                     "line": {"color": "red"},
+                    "name": "error",
                 },
             ],
             "layout": {
