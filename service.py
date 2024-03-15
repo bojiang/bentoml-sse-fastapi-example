@@ -15,7 +15,7 @@ from pyformance.registry import MetricsRegistry
 import curlparser
 
 MAX_COLD_START_TIME = 20
-COLLECTION_INTERVAL = 5
+COLLECTION_INTERVAL = 3
 
 
 def _make_metrics_registry() -> MetricsRegistry:
@@ -85,13 +85,18 @@ async def _data_collector_loop(request_id: str):
                 k for k in registry.dump_metrics() if k.startswith("error.")
             )
             error_infos = [
-                [k.split(".", maxsplit=1)[1] for k in error_metrics],
-                [registry.counter(k).get_count() for k in error_metrics],
+                (k.split(".", maxsplit=1)[1], registry.counter(k).get_count())
+                for k in error_metrics
             ]
+            error_infos.sort(key=lambda x: x[1], reverse=True)
             DATAS[request_id].append(
                 {
                     "plot": "error",
-                    "data": error_infos.sort(key=lambda x: x[1], reverse=True),
+                    "data": [
+                        [k.split(".", maxsplit=1)[0] for k, _ in error_infos],
+                        [k.split(".", maxsplit=1)[1] for k, _ in error_infos],
+                        [v for _, v in error_infos],
+                    ],
                     "trace": 0,
                     "operation": "replace",
                 }
@@ -137,7 +142,7 @@ async def _user_loop(request_id: str, request_info: curlparser.parser.ParsedComm
                     timeout=request_info.max_time,
                 ) as response:
                     content = await response.read()
-                    abstract = content.decode()[:20]
+                    abstract = content.decode()[:50]
                 METRICS[request_id].histogram("response.latency").add(time.time() - now)
                 METRICS[request_id].counter("request.total").inc()
                 if response.status >= 400 and response.status < 600:
@@ -149,7 +154,10 @@ async def _user_loop(request_id: str, request_info: curlparser.parser.ParsedComm
                 METRICS[request_id].counter("user").dec()
                 return
             except Exception as e:
-                METRICS[request_id].counter(f"error.{type(e).__name__}.{e}").inc()
+                abstract = str(e)[:50]
+                METRICS[request_id].counter(
+                    f"error.{type(e).__name__}.{abstract}"
+                ).inc()
                 METRICS[request_id].counter("request.error").inc()
             finally:
                 METRICS[request_id].counter("request.active").dec()
@@ -284,7 +292,6 @@ TEMPLATE = """
 </html>
         """
 
-
 @app.route("/chart/{chart_id}")
 async def chart(request):
     chart_id = request.path_params["chart_id"]
@@ -342,7 +349,7 @@ async def chart(request):
                 {
                     "type": "table",
                     "header": {
-                        "values": ["error", "count"],
+                        "values": ["error", "messages", "count"],
                         "align": "center",
                         "line": {"width": 1, "color": "black"},
                         "fill": {"color": "grey"},
