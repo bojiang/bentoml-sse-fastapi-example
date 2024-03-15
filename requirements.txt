@@ -1,3 +1,4 @@
 curlparser
 jinja2
 pyformance
+psutil

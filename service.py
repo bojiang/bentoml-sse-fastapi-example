@@ -2,12 +2,14 @@ import asyncio
 import collections
 import json
 import math
+import os
 import time
 import uuid
 
 import aiohttp
 import bentoml
 import jinja2
+import psutil
 import starlette.applications
 import starlette.responses
 from pyformance.registry import MetricsRegistry
@@ -16,6 +18,8 @@ import curlparser
 
 MAX_COLD_START_TIME = 20
 COLLECTION_INTERVAL = 3
+PID = os.getpid()
+CURRENT_PROC = psutil.Process(PID)
 
 
 def _make_metrics_registry() -> MetricsRegistry:
@@ -40,13 +44,14 @@ async def _data_collector_loop(request_id: str):
         start_time = time.time()
         while True:
             registry = METRICS[request_id]
+            now = int((time.time() - start_time) * 100) / 100
 
             total = registry.counter("request.total").get_count()
             DATAS[request_id].append(
                 {
                     "plot": "throughput",
                     "data": {
-                        "x": [[time.time() - start_time]],
+                        "x": [[now]],
                         "y": [[(total - last_total) / COLLECTION_INTERVAL]],
                     },
                     "trace": 0,
@@ -60,7 +65,7 @@ async def _data_collector_loop(request_id: str):
                 {
                     "plot": "throughput",
                     "data": {
-                        "x": [[time.time() - start_time]],
+                        "x": [[now]],
                         "y": [[(total - last_total_errors) / COLLECTION_INTERVAL]],
                     },
                     "trace": 1,
@@ -75,7 +80,7 @@ async def _data_collector_loop(request_id: str):
                     {
                         "plot": "latency",
                         "data": {
-                            "x": [[time.time() - start_time]],
+                            "x": [[now]],
                             "y": [[registry.histogram("response.latency").get_max()]],
                         },
                         "trace": 0,
@@ -86,7 +91,7 @@ async def _data_collector_loop(request_id: str):
                     {
                         "plot": "latency",
                         "data": {
-                            "x": [[time.time() - start_time]],
+                            "x": [[now]],
                             "y": [
                                 [
                                     registry.histogram("response.latency")
@@ -103,7 +108,7 @@ async def _data_collector_loop(request_id: str):
                     {
                         "plot": "latency",
                         "data": {
-                            "x": [[time.time() - start_time]],
+                            "x": [[now]],
                             "y": [
                                 [
                                     registry.histogram("response.latency")
@@ -119,12 +124,13 @@ async def _data_collector_loop(request_id: str):
 
             DATAS[request_id].append(
                 {
-                    "plot": "user",
+                    "plot": "system",
                     "data": [
                         [registry.counter("user").get_count()],
                         [registry.counter("request.total").get_count()],
                         [registry.counter("request.error").get_count()],
                         [registry.histogram("response.latency").get_mean()],
+                        [f"{CURRENT_PROC.cpu_percent(interval=None)}%"],
                     ],
                     "trace": 0,
                     "operation": "replace",
@@ -273,14 +279,12 @@ class Bees:
     @bentoml.api
     async def benchmark_bento_api(
         self,
-        code: str = "curl https://baidu.com",
+        code: str = "curl https://httpbin.org",
         users: int = 10,
-        duration: int = 300,
-        ctx: bentoml.Context = None,  # type: ignore
+        duration: int = 60,
     ) -> dict:
         result_id = str(uuid.uuid4())
         asyncio.create_task(_benchmark_task(result_id, code, users, duration))
-        # ctx.response.status_code = 202
         return {
             "status": "accepted",
             "result": f"/chart/{result_id}",
@@ -293,7 +297,7 @@ TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Real-time Scatter Plot with Plotly.js</title>
+    <title>Bees: Benchmark Result</title>
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 </head>
 <body>
@@ -346,7 +350,7 @@ TEMPLATE = """
 
 
 @app.route("/")
-async def index(request):
+async def index(_):
     """
     Home page
 
@@ -390,11 +394,11 @@ async def index(request):
         <p>Submit a curl command (could be copied from playground) and the number of users and duration, then jump to the result chart page.</p>
         <form id="benchmark-form" onsubmit="submitForm(event)">
             <label for="code">Curl Command:</label><br>
-            <textarea id="code" name="code" rows="4" cols="50">curl https://baidu.com</textarea><br>
+            <textarea id="code" name="code" rows="4" cols="50">curl https://httpbin.org</textarea><br>
             <label for="users">Users:</label><br>
             <input type="number" id="users" name="users" value="10"><br>
-            <label for="duration">Duration:</label><br>
-            <input type="number" id="duration" name="duration" value="300"><br><br>
+            <label for="duration">Test Duration:(s)</label><br>
+            <input type="number" id="duration" name="duration" value="60"><br><br>
             <input type="submit" value="Submit">
         </form>
         </body>
@@ -408,19 +412,25 @@ async def chart(request):
     chart_id = request.path_params["chart_id"]
     plots = [
         {
-            "name": "user",
+            "name": "system",
             "traces": [
                 {
                     "type": "table",
                     "header": {
-                        "values": ["users", "requests", "errors", "response time(s)"],
+                        "values": [
+                            "Active Users",
+                            "Requests",
+                            "Errors",
+                            "Average Latency(s)",
+                            "Client CPU Usage",
+                        ],
                         "align": "center",
                         "line": {"width": 1, "color": "black"},
                         "fill": {"color": "grey"},
                         "font": {"family": "Arial", "size": 12, "color": "white"},
                     },
                     "cells": {
-                        "values": [[0], [0], [0], [0]],
+                        "values": [[0], [0], [0], [0], ["0%"]],
                         "align": "center",
                         "line": {"color": "black", "width": 1},
                         "fill": {"color": ["white", "white", "white", "white"]},
@@ -428,6 +438,10 @@ async def chart(request):
                     },
                 }
             ],
+            "layout": {
+                "title": "System Status",
+                "height": 250,
+            },
         },
         {
             "name": "throughput",
@@ -474,7 +488,7 @@ async def chart(request):
                     "mode": "lines+markers",
                     "type": "scatter",
                     "fill": "tozeroy",
-                    "line": {"color": "yellow"},
+                    "line": {"color": "orange"},
                     "name": "P99",
                 },
                 {
@@ -514,6 +528,9 @@ async def chart(request):
                     },
                 }
             ],
+            "layout": {
+                "title": "Error",
+            },
         },
     ]
     return starlette.responses.HTMLResponse(
