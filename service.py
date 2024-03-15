@@ -40,6 +40,7 @@ async def _data_collector_loop(request_id: str):
         start_time = time.time()
         while True:
             registry = METRICS[request_id]
+
             total = registry.counter("request.total").get_count()
             DATAS[request_id].append(
                 {
@@ -68,6 +69,54 @@ async def _data_collector_loop(request_id: str):
             )
             last_total_errors = total
 
+            if registry.counter("request.total").get_count() > 0:
+                # latency metrics
+                DATAS[request_id].append(
+                    {
+                        "plot": "latency",
+                        "data": {
+                            "x": [[time.time() - start_time]],
+                            "y": [[registry.histogram("response.latency").get_max()]],
+                        },
+                        "trace": 0,
+                        "operation": "extend",
+                    }
+                )
+                DATAS[request_id].append(
+                    {
+                        "plot": "latency",
+                        "data": {
+                            "x": [[time.time() - start_time]],
+                            "y": [
+                                [
+                                    registry.histogram("response.latency")
+                                    .get_snapshot()
+                                    .get_99th_percentile()
+                                ]
+                            ],
+                        },
+                        "trace": 1,
+                        "operation": "extend",
+                    }
+                )
+                DATAS[request_id].append(
+                    {
+                        "plot": "latency",
+                        "data": {
+                            "x": [[time.time() - start_time]],
+                            "y": [
+                                [
+                                    registry.histogram("response.latency")
+                                    .get_snapshot()
+                                    .get_median()
+                                ]
+                            ],
+                        },
+                        "trace": 2,
+                        "operation": "extend",
+                    }
+                )
+
             DATAS[request_id].append(
                 {
                     "plot": "user",
@@ -81,6 +130,8 @@ async def _data_collector_loop(request_id: str):
                     "operation": "replace",
                 }
             )
+
+            # error metrics
             error_metrics = tuple(
                 k for k in registry.dump_metrics() if k.startswith("error.")
             )
@@ -103,6 +154,19 @@ async def _data_collector_loop(request_id: str):
             )
             NOTIFICATIONS[request_id].set()
             await asyncio.sleep(COLLECTION_INTERVAL)
+    except Exception as e:
+        DATAS[request_id].append(
+            {
+                "plot": "error",
+                "data": [
+                    [f"Bees internal error: {type(e).__name__}"],
+                    [str(e)],
+                    [1],
+                ],
+                "trace": 0,
+                "operation": "replace",
+            }
+        )
     finally:
         DATAS[request_id].append(None)
         NOTIFICATIONS[request_id].set()
@@ -349,7 +413,7 @@ async def chart(request):
                 {
                     "type": "table",
                     "header": {
-                        "values": ["users", "requests", "errors", "response time(ms)"],
+                        "values": ["users", "requests", "errors", "response time(s)"],
                         "align": "center",
                         "line": {"width": 1, "color": "black"},
                         "fill": {"color": "grey"},
@@ -390,6 +454,43 @@ async def chart(request):
                 "title": "Throughput",
                 "xaxis": {"title": "time(s)"},
                 "yaxis": {"title": "requests/s"},
+            },
+        },
+        {
+            "name": "latency",
+            "traces": [
+                {
+                    "x": [],
+                    "y": [],
+                    "mode": "lines+markers",
+                    "type": "scatter",
+                    "fill": "tozeroy",
+                    "name": "P100",
+                    "line": {"color": "red"},
+                },
+                {
+                    "x": [],
+                    "y": [],
+                    "mode": "lines+markers",
+                    "type": "scatter",
+                    "fill": "tozeroy",
+                    "line": {"color": "yellow"},
+                    "name": "P99",
+                },
+                {
+                    "x": [],
+                    "y": [],
+                    "mode": "lines+markers",
+                    "type": "scatter",
+                    "fill": "tozeroy",
+                    "line": {"color": "green"},
+                    "name": "P50",
+                },
+            ],
+            "layout": {
+                "title": "Latency(s)",
+                "xaxis": {"title": "time(s)"},
+                "yaxis": {"title": "latency(s)"},
             },
         },
         {
