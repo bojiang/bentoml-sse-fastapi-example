@@ -23,10 +23,6 @@ def _make_metrics_registry() -> MetricsRegistry:
     registry.counter("user")
     registry.counter("request.total")
     registry.counter("request.error")
-    registry.counter("request.timeout")
-    registry.counter("request.2xx")
-    registry.counter("request.4xx")
-    registry.counter("request.5xx")
     registry.gauge("request.active")
     registry.histogram("response.latency")
     return registry
@@ -40,6 +36,7 @@ NOTIFICATIONS = collections.defaultdict(asyncio.Event)
 async def _data_collector_loop(request_id: str):
     try:
         last_total = 0
+        last_total_errors = 0
         start_time = time.time()
         while True:
             registry = METRICS[request_id]
@@ -56,6 +53,21 @@ async def _data_collector_loop(request_id: str):
                 }
             )
             last_total = total
+
+            total = registry.counter("request.error").get_count()
+            DATAS[request_id].append(
+                {
+                    "plot": "throughput",
+                    "data": {
+                        "x": [[time.time() - start_time]],
+                        "y": [[(total - last_total_errors) / COLLECTION_INTERVAL]],
+                    },
+                    "trace": 1,
+                    "operation": "extend",
+                }
+            )
+            last_total_errors = total
+
             DATAS[request_id].append(
                 {
                     "plot": "user",
@@ -65,6 +77,21 @@ async def _data_collector_loop(request_id: str):
                         [registry.counter("request.error").get_count()],
                         [registry.histogram("response.latency").get_mean()],
                     ],
+                    "trace": 0,
+                    "operation": "replace",
+                }
+            )
+            error_metrics = tuple(
+                k for k in registry.dump_metrics() if k.startswith("error.")
+            )
+            error_infos = [
+                [k.split(".", maxsplit=1)[1] for k in error_metrics],
+                [registry.counter(k).get_count() for k in error_metrics],
+            ]
+            DATAS[request_id].append(
+                {
+                    "plot": "error",
+                    "data": error_infos.sort(key=lambda x: x[1], reverse=True),
                     "trace": 0,
                     "operation": "replace",
                 }
@@ -109,24 +136,20 @@ async def _user_loop(request_id: str, request_info: curlparser.parser.ParsedComm
                     cookies=request_info.cookies,
                     timeout=request_info.max_time,
                 ) as response:
-                    await response.read()
+                    content = await response.read()
+                    abstract = content.decode()[:20]
                 METRICS[request_id].histogram("response.latency").add(time.time() - now)
-
                 METRICS[request_id].counter("request.total").inc()
-                if response.status >= 200 and response.status < 300:
-                    METRICS[request_id].counter(f"request.{response.status}").inc()
-                elif response.status >= 400 and response.status < 500:
-                    METRICS[request_id].counter(f"request.{response.status}").inc()
-                elif response.status >= 500 and response.status < 600:
-                    METRICS[request_id].counter(f"request.{response.status}").inc()
-            # timeout
-            except asyncio.TimeoutError:
-                METRICS[request_id].counter("request.timeout").inc()
+                if response.status >= 400 and response.status < 600:
+                    METRICS[request_id].counter("request.error").inc()
+                    METRICS[request_id].counter(
+                        f"error.{response.status}.{abstract}"
+                    ).inc()
             except asyncio.CancelledError:
                 METRICS[request_id].counter("user").dec()
                 return
-            # other errors
-            except:
+            except Exception as e:
+                METRICS[request_id].counter(f"error.{type(e).__name__}.{e}").inc()
                 METRICS[request_id].counter("request.error").inc()
             finally:
                 METRICS[request_id].counter("request.active").dec()
@@ -265,52 +288,81 @@ TEMPLATE = """
 @app.route("/chart/{chart_id}")
 async def chart(request):
     chart_id = request.path_params["chart_id"]
-
-    trace = {
-        "x": [],
-        "y": [],
-        "mode": "lines+markers",
-        "type": "scatter",
-        "fill": "tozeroy",
-    }
-
-    layout = {
-        "title": "Throughput",
-        "xaxis": {"title": "time(s)"},
-        "yaxis": {"title": "request/s"},
-    }
-
-    table = {
-        "type": "table",
-        "header": {
-            "values": ["users", "requests", "errors", "response time(ms)"],
-            "align": "center",
-            "line": {"width": 1, "color": "black"},
-            "fill": {"color": "grey"},
-            "font": {"family": "Arial", "size": 12, "color": "white"},
+    plots = [
+        {
+            "name": "user",
+            "traces": [
+                {
+                    "type": "table",
+                    "header": {
+                        "values": ["users", "requests", "errors", "response time(ms)"],
+                        "align": "center",
+                        "line": {"width": 1, "color": "black"},
+                        "fill": {"color": "grey"},
+                        "font": {"family": "Arial", "size": 12, "color": "white"},
+                    },
+                    "cells": {
+                        "values": [[0], [0], [0], [0]],
+                        "align": "center",
+                        "line": {"color": "black", "width": 1},
+                        "fill": {"color": ["white", "white", "white", "white"]},
+                        "font": {"family": "Arial", "size": 11, "color": ["black"]},
+                    },
+                }
+            ],
         },
-        "cells": {
-            "values": [[0], [0], [0], [0]],
-            "align": "center",
-            "line": {"color": "black", "width": 1},
-            "fill": {"color": ["white", "white", "white", "white"]},
-            "font": {"family": "Arial", "size": 11, "color": ["black"]},
+        {
+            "name": "throughput",
+            "traces": [
+                {
+                    "x": [],
+                    "y": [],
+                    "mode": "lines+markers",
+                    "type": "scatter",
+                    "fill": "tozeroy",
+                },
+                {
+                    "x": [],
+                    "y": [],
+                    "mode": "lines+markers",
+                    "type": "scatter",
+                    "fill": "tozeroy",
+                    "line": {"color": "red"},
+                },
+            ],
+            "layout": {
+                "title": "Throughput",
+                "xaxis": {"title": "time(s)"},
+                "yaxis": {"title": "requests/s"},
+            },
         },
-    }
-
-    plot1 = {
-        "name": "throughput",
-        "traces": [trace],
-        "layout": layout,
-    }
-    plot2 = {
-        "name": "user",
-        "traces": [table],
-    }
+        {
+            "name": "error",
+            "traces": [
+                {
+                    "type": "table",
+                    "header": {
+                        "values": ["error", "count"],
+                        "align": "center",
+                        "line": {"width": 1, "color": "black"},
+                        "fill": {"color": "grey"},
+                        "font": {"family": "Arial", "size": 12, "color": "white"},
+                    },
+                    "cells": {
+                        "values": [],
+                        "align": "center",
+                        "line": {"color": "black", "width": 1},
+                        "fill": {"color": ["white", "white", "white", "white"]},
+                        "font": {"family": "Arial", "size": 11, "color": ["black"]},
+                    },
+                }
+            ],
+        },
+    ]
     return starlette.responses.HTMLResponse(
         jinja2.Template(TEMPLATE).render(
             chart_id=chart_id,
-            plots=[plot2, plot1],
+            plots=plots,
         )
     )
 
