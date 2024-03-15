@@ -17,7 +17,6 @@ from pyformance.registry import MetricsRegistry
 import curlparser
 
 MAX_COLD_START_TIME = 20
-COLLECTION_INTERVAL = 3
 PID = os.getpid()
 CURRENT_PROC = psutil.Process(PID)
 
@@ -37,7 +36,7 @@ DATAS = collections.defaultdict(list)
 NOTIFICATIONS = collections.defaultdict(asyncio.Event)
 
 
-async def _data_collector_loop(request_id: str):
+async def _data_collector_loop(request_id: str, interval: int = 2):
     try:
         last_total = 0
         last_total_errors = 0
@@ -52,7 +51,7 @@ async def _data_collector_loop(request_id: str):
                     "plot": "throughput",
                     "data": {
                         "x": [[now]],
-                        "y": [[(total - last_total) / COLLECTION_INTERVAL]],
+                        "y": [[(total - last_total) / interval]],
                     },
                     "trace": 0,
                     "operation": "extend",
@@ -66,7 +65,7 @@ async def _data_collector_loop(request_id: str):
                     "plot": "throughput",
                     "data": {
                         "x": [[now]],
-                        "y": [[(total - last_total_errors) / COLLECTION_INTERVAL]],
+                        "y": [[(total - last_total_errors) / interval]],
                     },
                     "trace": 1,
                     "operation": "extend",
@@ -159,7 +158,7 @@ async def _data_collector_loop(request_id: str):
                 }
             )
             NOTIFICATIONS[request_id].set()
-            await asyncio.sleep(COLLECTION_INTERVAL)
+            await asyncio.sleep(interval)
     except Exception as e:
         DATAS[request_id].append(
             {
@@ -195,21 +194,29 @@ async def _stream_chart_data(request_id: str):
             await NOTIFICATIONS[request_id].wait()
 
 
-async def _user_loop(request_id: str, request_info: curlparser.parser.ParsedCommand):
+async def _user_loop(
+    request_id: str,
+    request_info: curlparser.parser.ParsedCommand,
+    timeout_override: int | None,
+) -> None:
     dummy_cookie_jar = aiohttp.DummyCookieJar()
     METRICS[request_id].counter("user").inc()
+    timeout = timeout_override or request_info.max_time
     while True:
-        async with aiohttp.ClientSession(cookie_jar=dummy_cookie_jar) as session:
-            now = time.time()
-            try:
-                METRICS[request_id].counter("request.active").inc()
+        try:
+            METRICS[request_id].counter("request.active").inc()
+            async with aiohttp.ClientSession(
+                cookie_jar=dummy_cookie_jar,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as session:
+                now = time.time()
                 async with session.request(
                     method=request_info.method,
                     url=request_info.url,
                     headers=request_info.headers,
                     data=request_info.data,
                     cookies=request_info.cookies,
-                    timeout=request_info.max_time,
+                    timeout=timeout,
                 ) as response:
                     content = await response.read()
                     abstract = content.decode()[:50]
@@ -220,47 +227,66 @@ async def _user_loop(request_id: str, request_info: curlparser.parser.ParsedComm
                     METRICS[request_id].counter(
                         f"error.{response.status}.{abstract}"
                     ).inc()
-            except asyncio.CancelledError:
-                METRICS[request_id].counter("user").dec()
-                return
-            except Exception as e:
-                abstract = str(e)[:50]
-                METRICS[request_id].counter(
-                    f"error.{type(e).__name__}.{abstract}"
-                ).inc()
-                METRICS[request_id].counter("request.error").inc()
-            finally:
-                METRICS[request_id].counter("request.active").dec()
+        except asyncio.CancelledError:
+            METRICS[request_id].counter("user").dec()
+            return
+        except Exception as e:
+            abstract = str(e)[:50]
+            METRICS[request_id].counter(f"error.{type(e).__name__}.{abstract}").inc()
+            METRICS[request_id].counter("request.error").inc()
+        finally:
+            METRICS[request_id].counter("request.active").dec()
 
 
-async def _benchmark_task(result_id: str, code, users: int | None, duration: int):
+async def _benchmark_task(
+    result_id: str,
+    code,
+    users: int | None,
+    duration: int,
+    timeout_override: int | None = None,
+    collector_interval: int = 2,
+):
     if result_id in METRICS:
         return
     if users is None:
         users = 10
     parsed = curlparser.parse(code)
-    cold_start_time = min(duration / 10, MAX_COLD_START_TIME)
+    cold_start_time = min(duration / 3, MAX_COLD_START_TIME)
 
     benchmark_start = time.time()
+    spawn_interval = float(cold_start_time) / users
 
     user_tasks = []
-    spawn_interval = float(cold_start_time) / users
-    collector_task = asyncio.create_task(_data_collector_loop(result_id))
-    for i in range(users):
-        user_tasks.append(
-            asyncio.create_task(_user_loop(result_id, parsed), name=f"user_{i}")
-        )
-        await asyncio.sleep(spawn_interval)
+    try:
+        collector_task = asyncio.create_task(_data_collector_loop(result_id))
+        for i in range(users):
+            user_tasks.append(
+                asyncio.create_task(
+                    _user_loop(result_id, parsed, timeout_override), name=f"user_{i}"
+                )
+            )
+            await asyncio.sleep(spawn_interval)
+        countdown = duration - (time.time() - benchmark_start)
+        while countdown >= 0:
+            if result_id not in METRICS:  # stop benchmark
+                break
+            await asyncio.sleep(1)
+            countdown -= 1
+    finally:
+        for task in user_tasks:
+            task.cancel()
+        collector_task.cancel()
+        if result_id in METRICS:
+            METRICS.pop(result_id)
 
-    await asyncio.sleep(duration - (time.time() - benchmark_start))
-    for task in user_tasks:
-        task.cancel()
-    collector_task.cancel()
+        await asyncio.sleep(1800)
 
-    await asyncio.sleep(1800)
-    METRICS.pop(result_id)
-    DATAS.pop(result_id)
-    NOTIFICATIONS.pop(result_id)
+        if result_id in METRICS:
+            METRICS.pop(result_id)
+        if result_id in DATAS:
+            DATAS.pop(result_id)
+        if result_id in NOTIFICATIONS:
+            NOTIFICATIONS.pop(result_id)
 
 
 @bentoml.service
@@ -277,18 +303,35 @@ class Bees:
         )
 
     @bentoml.api
-    async def benchmark_bento_api(
+    async def start_bento_benchmark(
         self,
         code: str = "curl https://httpbin.org",
         users: int = 10,
         duration: int = 60,
+        timeout: int | None = None,
+        interval: int = 2,
     ) -> dict:
         result_id = str(uuid.uuid4())
-        asyncio.create_task(_benchmark_task(result_id, code, users, duration))
+        asyncio.create_task(
+            _benchmark_task(
+                result_id,
+                code,
+                users,
+                duration,
+                timeout,
+                interval,
+            )
+        )
         return {
             "status": "accepted",
             "result": f"/chart/{result_id}",
         }
+
+    @bentoml.api
+    async def stop_bento_benchmark(self, result_id: str) -> dict:
+        if result_id in METRICS:
+            METRICS.pop(result_id)
+        return {"status": "accepted"}
 
 
 app = starlette.applications.Starlette()
@@ -367,12 +410,14 @@ async def index(_):
                     var users = form.elements["users"].value;
                     var duration = form.elements["duration"].value;
                     var code = form.elements["code"].value;
+                    var timeout = form.elements["timeout"].value;
+                    var interval = form.elements["interval"].value;
                     if (users < 1 || duration < 1) {
                         alert("Users and duration must be greater than 0");
                         return;
                     }
                     // fetch the result chart page and jump to it
-                    fetch("/benchmark_bento_api", {
+                    fetch("/start_bento_benchmark", {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/json",
@@ -381,6 +426,8 @@ async def index(_):
                             code: code,
                             users: users,
                             duration: duration,
+                            timeout: timeout,
+                            interval: interval,
                         }),
                     }).then(response => response.json()).then(data => {
                         window.location.href = data.result;
@@ -394,11 +441,15 @@ async def index(_):
         <p>Submit a curl command (could be copied from playground) and the number of users and duration, then jump to the result chart page.</p>
         <form id="benchmark-form" onsubmit="submitForm(event)">
             <label for="code">Curl Command:</label><br>
-            <textarea id="code" name="code" rows="4" cols="50">curl https://httpbin.org</textarea><br>
+            <textarea id="code" name="code" rows="4" cols="50">curl https://httpbin.org</textarea><br><br>
             <label for="users">Users:</label><br>
             <input type="number" id="users" name="users" value="10"><br>
             <label for="duration">Test Duration:(s)</label><br>
-            <input type="number" id="duration" name="duration" value="60"><br><br>
+            <input type="number" id="duration" name="duration" value="60"><br>
+            <label for="timeout">Timeout:(s)</label><br>
+            <input type="number" id="timeout" name="timeout" value="60"><br>
+            <label for="interval">Collector Interval:(s)</label><br>
+            <input type="number" id="interval" name="interval" value="2"><br><br>
             <input type="submit" value="Submit">
         </form>
         </body>
