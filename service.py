@@ -282,7 +282,7 @@ TEMPLATE = """
 
 
 @app.route("/")
-async def index():
+async def index(request):
     """
     Home page
 
